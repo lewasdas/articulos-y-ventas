@@ -1,6 +1,7 @@
 const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -15,6 +16,21 @@ function slugify(text) {
 
 function formatDate(date) {
   return date.toISOString().split("T")[0];
+}
+
+// Markdown to basic HTML for WordPress
+function markdownToHtml(md) {
+  return md
+    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
+    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/`(.+?)`/g, "<code>$1</code>")
+    .replace(/^\- (.+)$/gm, "<li>$1</li>")
+    .replace(/(<li>.*<\/li>\n?)+/g, "<ul>$&</ul>")
+    .replace(/\n\n/g, "</p><p>")
+    .replace(/^(?!<[hul])(.+)$/gm, "<p>$1</p>")
+    .replace(/<p><\/p>/g, "");
 }
 
 async function generateTopic() {
@@ -40,8 +56,6 @@ Reply with ONLY the topic title, nothing else. No quotes, no explanation.`,
 }
 
 async function generateArticle(topic) {
-  const today = formatDate(new Date());
-
   const msg = await client.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 4000,
@@ -77,10 +91,7 @@ TAGS: [tag1, tag2, tag3, tag4]`,
     : `Learn everything about ${topic} in this comprehensive guide.`;
 
   const tags = tagsMatch
-    ? tagsMatch[1]
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean)
+    ? tagsMatch[1].split(",").map((t) => t.trim()).filter(Boolean)
     : ["AI", "Technology", "2026"];
 
   const content = raw
@@ -91,6 +102,186 @@ TAGS: [tag1, tag2, tag3, tag4]`,
   return { content, description, tags };
 }
 
+async function publishToWordPress(topic, content, description, tags) {
+  const wpUrl = process.env.WP_URL;
+  const wpUser = process.env.WP_USER;
+  const wpPassword = process.env.WP_APP_PASSWORD;
+
+  if (!wpUrl || !wpUser || !wpPassword) {
+    console.log("WordPress: skipped (no credentials)");
+    return null;
+  }
+
+  const html = markdownToHtml(content);
+  const credentials = Buffer.from(`${wpUser}:${wpPassword}`).toString("base64");
+
+  const body = JSON.stringify({
+    title: topic,
+    content: html,
+    excerpt: description,
+    status: "publish",
+    tags: tags,
+  });
+
+  return new Promise((resolve) => {
+    const url = new URL(`${wpUrl}/wp-json/wp/v2/posts`);
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname,
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (d) => (data += d));
+      res.on("end", () => {
+        const json = JSON.parse(data);
+        if (json.link) {
+          console.log("WordPress: published →", json.link);
+          resolve(json.link);
+        } else {
+          console.log("WordPress error:", json.message);
+          resolve(null);
+        }
+      });
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function getLinkedInAccessToken() {
+  const clientId = process.env.LINKEDIN_CLIENT_ID;
+  const clientSecret = process.env.LINKEDIN_CLIENT_SECRET;
+  const refreshToken = process.env.LINKEDIN_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) return null;
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: clientId,
+    client_secret: clientSecret,
+  }).toString();
+
+  return new Promise((resolve) => {
+    const options = {
+      hostname: "www.linkedin.com",
+      path: "/oauth/v2/accessToken",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (d) => (data += d));
+      res.on("end", () => {
+        const json = JSON.parse(data);
+        resolve(json.access_token || null);
+      });
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function publishToLinkedIn(topic, description, wpLink) {
+  if (!process.env.LINKEDIN_CLIENT_ID) {
+    console.log("LinkedIn: skipped (no credentials)");
+    return;
+  }
+
+  const accessToken = await getLinkedInAccessToken();
+  if (!accessToken) {
+    console.log("LinkedIn: failed to get access token");
+    return;
+  }
+
+  // Get LinkedIn user URN
+  const profileUrn = await new Promise((resolve) => {
+    const options = {
+      hostname: "api.linkedin.com",
+      path: "/v2/userinfo",
+      method: "GET",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    };
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (d) => (data += d));
+      res.on("end", () => {
+        const json = JSON.parse(data);
+        resolve(json.sub ? `urn:li:person:${json.sub}` : null);
+      });
+    });
+    req.end();
+  });
+
+  if (!profileUrn) {
+    console.log("LinkedIn: could not get profile URN");
+    return;
+  }
+
+  const articleUrl = wpLink || "https://aipulse.vercel.app";
+  const postText = `🤖 New article: ${topic}\n\n${description}\n\nRead more 👇\n${articleUrl}\n\n#AI #Technology #ArtificialIntelligence #Tech2026`;
+
+  const body = JSON.stringify({
+    author: profileUrn,
+    lifecycleState: "PUBLISHED",
+    specificContent: {
+      "com.linkedin.ugc.ShareContent": {
+        shareCommentary: { text: postText },
+        shareMediaCategory: "ARTICLE",
+        media: [
+          {
+            status: "READY",
+            originalUrl: articleUrl,
+            title: { text: topic },
+            description: { text: description },
+          },
+        ],
+      },
+    },
+    visibility: { "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC" },
+  });
+
+  return new Promise((resolve) => {
+    const options = {
+      hostname: "api.linkedin.com",
+      path: "/v2/ugcPosts",
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        "X-Restli-Protocol-Version": "2.0.0",
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (d) => (data += d));
+      res.on("end", () => {
+        if (res.statusCode === 201) {
+          console.log("LinkedIn: post published ✓");
+        } else {
+          console.log("LinkedIn error:", data);
+        }
+        resolve();
+      });
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
 async function main() {
   console.log("Generating topic...");
   const topic = await generateTopic();
@@ -99,9 +290,9 @@ async function main() {
   console.log("Generating article...");
   const { content, description, tags } = await generateArticle(topic);
 
+  // Save to file for Vercel blog
   const slug = slugify(topic);
   const date = formatDate(new Date());
-
   const frontmatter = `---
 title: "${topic}"
 date: "${date}"
@@ -111,18 +302,17 @@ slug: "${slug}"
 ---
 
 `;
+  const filePath = path.join(__dirname, "..", "content", "articles", `${slug}.md`);
+  fs.writeFileSync(filePath, frontmatter + content, "utf8");
+  console.log(`Saved: ${filePath}`);
 
-  const fullArticle = frontmatter + content;
-  const filePath = path.join(
-    __dirname,
-    "..",
-    "content",
-    "articles",
-    `${slug}.md`
-  );
+  // Publish to WordPress
+  const wpLink = await publishToWordPress(topic, content, description, tags);
 
-  fs.writeFileSync(filePath, fullArticle, "utf8");
-  console.log(`Article saved: ${filePath}`);
+  // Publish to LinkedIn
+  await publishToLinkedIn(topic, description, wpLink);
+
+  console.log("Done!");
 }
 
 main().catch((err) => {
