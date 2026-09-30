@@ -282,15 +282,16 @@ async function publishToLinkedIn(topic, description, wpLink) {
   });
 }
 
-async function main() {
-  console.log("Generating topic...");
+const ARTICLES_PER_DAY = parseInt(process.env.ARTICLES_PER_DAY || "10");
+
+async function generateOne(index) {
+  console.log(`\n[${index + 1}/${ARTICLES_PER_DAY}] Generating topic...`);
   const topic = await generateTopic();
   console.log(`Topic: ${topic}`);
 
   console.log("Generating article...");
   const { content, description, tags } = await generateArticle(topic);
 
-  // Save to file for Vercel blog
   const slug = slugify(topic);
   const date = formatDate(new Date());
   const frontmatter = `---
@@ -306,13 +307,18 @@ slug: "${slug}"
   fs.writeFileSync(filePath, frontmatter + content, "utf8");
   console.log(`Saved: ${filePath}`);
 
-  // Publish to WordPress
   const wpLink = await publishToWordPress(topic, content, description, tags);
-
-  // Publish to LinkedIn
   await publishToLinkedIn(topic, description, wpLink);
+}
 
-  console.log("Done!");
+async function main() {
+  console.log(`Starting: ${ARTICLES_PER_DAY} articles today`);
+
+  for (let i = 0; i < ARTICLES_PER_DAY; i++) {
+    await generateOne(i);
+  }
+
+  console.log(`\nDone! ${ARTICLES_PER_DAY} articles published.`);
 }
 
 main().catch((err) => {
